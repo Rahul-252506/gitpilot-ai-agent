@@ -136,6 +136,11 @@ class AgentOrchestrator:
         # short-circuit exact duplicate requests from the model so a looping
         # agent cannot burn its whole step budget re-fetching the same file.
         executed_calls: set[str] = set()
+        # Set once a correction round is scheduled: the next request is the
+        # forced-JSON final-report turn (no tools declared, JSON mode on).
+        # Combining JSON response mime type with function declarations makes
+        # current Gemini models fail (HTTP 500), so the two modes never mix.
+        finalizing = False
 
         while True:
             if ctx.timed_out:
@@ -158,8 +163,8 @@ class AgentOrchestrator:
             try:
                 response = self.provider.complete(
                     ctx.messages,
-                    self.registry.specs(),
-                    response_format={"type": "json_object"},
+                    [] if finalizing else self.registry.specs(),
+                    response_format={"type": "json_object"} if finalizing else None,
                 )
             except LLMError as exc:
                 # Provider/configuration/network failures end the run cleanly
@@ -186,7 +191,8 @@ class AgentOrchestrator:
                     return self._fail(ctx, exc)
                 if outcome is not None:
                     return outcome
-                continue  # a correction round was scheduled
+                finalizing = True  # a correction round was scheduled
+                continue
 
             self._handle_tool_calls(ctx, response.tool_calls, executed_calls)
             if ctx.fatal_error is not None:

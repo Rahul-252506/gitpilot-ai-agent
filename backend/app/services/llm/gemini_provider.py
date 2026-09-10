@@ -9,10 +9,11 @@ Isolated in this module; the rest of the application only knows
 
 Function/tool calling: the model receives OpenAPI-style function declarations
 and answers with ``function_call`` parts; tool results are fed back as
-``function_response`` parts. The final structured answer is requested with
-JSON response mime type where the model accepts it; correctness is always
-enforced by the orchestrator's Pydantic validation, never by trusting the
-provider.
+``function_response`` parts. JSON response mime type is used only on
+tools-free structured requests (the final report turn) — combining it with
+function declarations makes current Gemini models fail with HTTP 500.
+Correctness is always enforced by the orchestrator's Pydantic validation,
+never by trusting the provider.
 
 The SDK client can be injected (``client=``) so unit tests run without the
 package or network.
@@ -169,20 +170,27 @@ class GeminiLLMProvider(LLMProvider):
                 types.Tool(function_declarations=_to_function_declarations(tools, types))
             ]
 
+        # JSON response mime type is only requested for tools-free
+        # structured calls (the final report turn): combining it with
+        # function declarations makes current Gemini models fail — e.g.
+        # gemini-3.1-flash-lite answers HTTP 500 INTERNAL on every such
+        # request. Intermediate tool-calling turns use plain function
+        # calling, exactly matching Gemini's supported combinations.
+        mime_type = "application/json" if response_format and not tools else None
         base_config: dict[str, Any] = {
             "system_instruction": system_prompt,
             "temperature": self._temperature,
             **tool_config,
         }
+        if mime_type:
+            base_config["response_mime_type"] = mime_type
 
-        # Prefer JSON output mode for the structured final answer. Some model
-        # versions reject combining it with function declarations — retry
-        # without it rather than failing the run.
         attempts: list[dict[str, Any]] = [dict(base_config)]
-        if response_format and tools:
-            json_config = dict(base_config)
-            json_config["response_mime_type"] = "application/json"
-            attempts.insert(0, json_config)
+        if mime_type:
+            # The model rejected JSON mode (e.g. unsupported on this model
+            # version) — retry once without it; Pydantic validation in the
+            # orchestrator still guarantees correctness of the final report.
+            attempts.append({k: v for k, v in base_config.items() if k != "response_mime_type"})
 
         last_error: Exception | None = None
         for index, config_kwargs in enumerate(attempts):

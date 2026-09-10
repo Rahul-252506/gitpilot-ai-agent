@@ -152,19 +152,45 @@ class TestResponseMapping:
 
 
 class TestJsonModeFallback:
-    def test_400_with_json_mime_retries_without_it(self):
+    """JSON response mime type is used ONLY on tools-free structured calls.
+
+    Combining JSON mime with function declarations makes current Gemini
+    models (e.g. gemini-3.1-flash-lite) fail with HTTP 500 INTERNAL, so the
+    two modes are never mixed: tool turns use plain function calling; the
+    final structured turn uses JSON mode without tools. If the model still
+    rejects JSON mode there, one plain-config retry follows.
+    """
+
+    def test_tool_turn_does_not_force_json_mime(self):
+        """Tool-calling requests must not send response_mime_type at all."""
+        provider, client = make_provider([make_response(text="{}")])
+        provider.complete(sample_messages(), SAMPLE_TOOLS, response_format={"type": "json_object"})
+        assert len(client.models.calls) == 1  # single attempt, no fallback loop
+        config = client.models.calls[0]["config"]
+        assert config.response_mime_type is None
+        assert config.tools[0].function_declarations[0].name == "get_issue"
+
+    def test_structured_tools_free_turn_uses_json_mime(self):
+        """The final report request (no tools) gets JSON mode."""
+        provider, client = make_provider([make_response(text="{}")])
+        provider.complete(sample_messages(), [], response_format={"type": "json_object"})
+        config = client.models.calls[0]["config"]
+        assert config.response_mime_type == "application/json"
+        assert not config.tools
+
+    def test_json_mime_rejected_retries_without_it(self):
+        """If the model rejects JSON mode on the structured turn, one plain
+        retry follows instead of failing the run."""
         client = FakeClient([
-            genai_errors.ClientError(400, {"message": "response_mime_type not supported with tools"}),
+            genai_errors.ClientError(400, {"message": "response_mime_type not supported"}),
             make_response(text="{}"),
         ])
         provider = GeminiLLMProvider(api_key="fake", model="gemini-test", client=client)
-        response = provider.complete(sample_messages(), SAMPLE_TOOLS, response_format={"type": "json_object"})
+        response = provider.complete(sample_messages(), [], response_format={"type": "json_object"})
         assert response.content == "{}"
         assert len(client.models.calls) == 2
-        first_config = client.models.calls[0]["config"]
-        second_config = client.models.calls[1]["config"]
-        assert first_config.response_mime_type == "application/json"
-        assert second_config.response_mime_type is None
+        assert client.models.calls[0]["config"].response_mime_type == "application/json"
+        assert client.models.calls[1]["config"].response_mime_type is None
 
     def test_400_without_json_format_requested_fails_immediately(self):
         client = FakeClient([
