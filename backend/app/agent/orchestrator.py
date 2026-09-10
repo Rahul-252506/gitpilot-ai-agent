@@ -67,7 +67,7 @@ class AgentOrchestrator:
         provider: LLMProvider,
         registry: ToolRegistry,
         *,
-        max_steps: int = 12,
+        max_steps: int = 20,
         timeout_seconds: int = 300,
         structured_output_retries: int = 2,
         event_sink: EventSink | None = None,
