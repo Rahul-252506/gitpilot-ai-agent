@@ -9,11 +9,16 @@ Isolated in this module; the rest of the application only knows
 
 Function/tool calling: the model receives OpenAPI-style function declarations
 and answers with ``function_call`` parts; tool results are fed back as
-``function_response`` parts. JSON response mime type is used only on
-tools-free structured requests (the final report turn) — combining it with
-function declarations makes current Gemini models fail with HTTP 500.
-Correctness is always enforced by the orchestrator's Pydantic validation,
-never by trusting the provider.
+``function_response`` parts. Multi-turn history reconstruction preserves
+everything Gemini 3 requires: the API-issued function-call id on both the
+replayed call and its response (pairing by id — with ids stripped, repeated
+same-name calls are ambiguous and the request fails), the thought signature
+on each function-call part, and the model's visible text per turn. Thought
+parts are excluded from extracted text (no chain-of-thought exposure).
+JSON response mime type is used only on tools-free structured requests (the
+final report turn) — combining it with function declarations makes current
+Gemini models fail with HTTP 500. Correctness is always enforced by the
+orchestrator's Pydantic validation, never by trusting the provider.
 
 The SDK client can be injected (``client=``) so unit tests run without the
 package or network.
@@ -35,6 +40,20 @@ _DEFAULT_MODEL = "gemini-flash-latest"  # alias tracking the current GA flash mo
 _REQUEST_TIMEOUT_MS = 120_000  # 2 minutes per completion
 _TRANSIENT_RETRIES = 3  # extra attempts for 429/503 (free-tier demand spikes)
 _RETRY_BACKOFF_SECONDS = 2.0  # 2s, 4s, 8s
+# Prefix of synthetic tool-call ids generated when the API response carries
+# no function-call id. Synthetic ids are NEVER sent back to the API.
+_SYNTH_CALL_ID_PREFIX = "gem_call_"
+
+
+def _real_call_id(call_id: str | None) -> str | None:
+    """The API-issued function-call id, or None for synthetic/absent ids.
+
+    Gemini 3 pairs function calls with their function responses by id. Both
+    parts of a pair must carry the same id (or both must omit it) — a mix
+    breaks pairing, and repeated same-name calls become ambiguous."""
+    if not call_id or call_id.startswith(_SYNTH_CALL_ID_PREFIX):
+        return None
+    return call_id
 
 
 def _lazy_import():
@@ -58,9 +77,12 @@ def _to_gemini_contents(
 
     Gemini has two roles: "user" and "model". Assistant tool requests become
     ``function_call`` parts (role "model"); tool results become
-    ``function_response`` parts (role "user"). Gemini correlates responses by
-    function *name*, so the provider tracks the tool_call_id -> name mapping
-    from the preceding assistant message.
+    ``function_response`` parts (role "user"). Gemini 3 pairs calls with
+    responses by *id*, so the API-issued function-call id is preserved on
+    both the replayed FunctionCall and the matching FunctionResponse — with
+    ids stripped, two calls to the same tool name are ambiguous and the
+    request is rejected. The model's own visible text for the turn is kept
+    as a text part so the complete model response is preserved in history.
     """
     contents: list[Any] = []
     id_to_name: dict[str, str] = {}
@@ -72,12 +94,23 @@ def _to_gemini_contents(
             if msg.tool_calls:
                 id_to_name.update({tc.id: tc.name for tc in msg.tool_calls})
                 parts = []
+                if msg.content:
+                    # Preserve the model's own visible text for this turn so
+                    # the complete response is replayed, not just the calls.
+                    parts.append(types.Part(text=msg.content))
                 for tc in msg.tool_calls:
                     signature = (tc.metadata or {}).get("thought_signature")
+                    fc_kwargs: dict[str, Any] = {
+                        "name": tc.name,
+                        "args": dict(tc.arguments or {}),
+                    }
+                    call_id = _real_call_id(tc.id)
+                    if call_id is not None:
+                        # Replay the API-issued id so the response can be
+                        # paired with its call unambiguously.
+                        fc_kwargs["id"] = call_id
                     part_kwargs: dict[str, Any] = {
-                        "function_call": types.FunctionCall(
-                            name=tc.name, args=dict(tc.arguments or {})
-                        )
+                        "function_call": types.FunctionCall(**fc_kwargs)
                     }
                     if signature is not None:
                         # Gemini 3 requires thought signatures to round-trip
@@ -91,17 +124,17 @@ def _to_gemini_contents(
                 )
         elif msg.role == "tool":
             name = id_to_name.get(msg.tool_call_id or "", "tool")
+            fr_kwargs: dict[str, Any] = {
+                "name": name,
+                "response": {"result": msg.content or ""},
+            }
+            fr_call_id = _real_call_id(msg.tool_call_id)
+            if fr_call_id is not None:
+                fr_kwargs["id"] = fr_call_id  # must match its function call
             contents.append(
                 types.Content(
                     role="user",
-                    parts=[
-                        types.Part(
-                            function_response=types.FunctionResponse(
-                                name=name,
-                                response={"result": msg.content or ""},
-                            )
-                        )
-                    ],
+                    parts=[types.Part(function_response=types.FunctionResponse(**fr_kwargs))],
                 )
             )
         else:  # user
@@ -259,7 +292,10 @@ class GeminiLLMProvider(LLMProvider):
                     if fc is None:
                         continue
                     args = dict(getattr(fc, "args", None) or {})
-                    call_id = getattr(fc, "id", None) or f"gem_call_{index + 1}"
+                    call_id = (
+                        getattr(fc, "id", None)
+                        or f"{_SYNTH_CALL_ID_PREFIX}{index + 1}"
+                    )
                     metadata: dict[str, Any] = {}
                     signature = getattr(part, "thought_signature", None)
                     if signature is not None:
@@ -302,11 +338,21 @@ def _sdk_server_error_type():
 
 
 def _extract_text(response: Any) -> str | None:
+    """Join the response's visible text parts, excluding thought parts.
+
+    Thought parts carry the model's internal reasoning; they must neither be
+    shown to the user (no chain-of-thought exposure) nor treated as output
+    text. Only genuine text parts are returned.
+    """
     try:
         candidates = getattr(response, "candidates", None) or []
         for candidate in candidates:
             parts = getattr(getattr(candidate, "content", None), "parts", None) or []
-            texts = [p.text for p in parts if getattr(p, "text", None)]
+            texts = [
+                p.text
+                for p in parts
+                if getattr(p, "text", None) and not getattr(p, "thought", False)
+            ]
             if texts:
                 return "".join(texts)
     except Exception:

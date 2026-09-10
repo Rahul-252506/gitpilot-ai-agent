@@ -5,6 +5,7 @@ The fake client mimics only the surface the provider uses:
 """
 from __future__ import annotations
 
+import base64
 from types import SimpleNamespace
 from typing import Any
 
@@ -200,6 +201,163 @@ class TestJsonModeFallback:
         with pytest.raises(LLMError):
             provider.complete(sample_messages(), SAMPLE_TOOLS)
         assert len(client.models.calls) == 1
+
+
+class TestMultiTurnHistoryReconstruction:
+    """Regression tests for the Gemini 3 multi-turn history reconstruction.
+
+    Live failure: after two successful tool rounds, the NEXT multi-turn
+    request failed. Root causes found: (a) FunctionCall.id was stripped from
+    replayed history while Gemini 3 pairs calls with responses by id — two
+    same-name calls (e.g. get_file twice) become ambiguous; (b) the model's
+    visible text for a tool-call turn was dropped. These tests pin the exact
+    required round-trip: user → FC+signature → tool result → FC+signature →
+    tool result → continuation.
+    """
+
+    # Real API thought signatures are base64-encoded blobs; the SDK's Part
+    # model validates the encoding, so tests must use realistic values.
+    SIG_A = base64.b64encode(b"signature-a").decode()
+    SIG_B = base64.b64encode(b"signature-b").decode()
+
+    @staticmethod
+    def _fc_response(name, call_id, signature, args=None, text=None):
+        """A fake Gemini response: one function-call part (with API-issued id
+        and thought signature) plus an optional visible text part."""
+        parts = [
+            SimpleNamespace(
+                function_call=gtypes.FunctionCall(name=name, args=args or {"q": "auth"}, id=call_id),
+                text=None,
+                thought_signature=signature,
+                thought=False,
+            )
+        ]
+        if text is not None:
+            parts.append(SimpleNamespace(text=text, thought_signature=None, thought=False))
+        return SimpleNamespace(candidates=[SimpleNamespace(content=SimpleNamespace(parts=parts))])
+
+    def test_full_two_round_signature_round_trip(self):
+        """user → FC+sig → tool → FC+sig → tool → continuation: every id and
+        signature must survive every mapping step."""
+        client = FakeClient([
+            self._fc_response("get_issue", "fc_1", TestMultiTurnHistoryReconstruction.SIG_A, args={"owner": "acme"}),
+            self._fc_response("get_file", "fc_2", TestMultiTurnHistoryReconstruction.SIG_B, args={"path": "auth.py"}, text="Checking auth.py next."),
+            make_response(text="continuation answer"),
+        ])
+        provider = GeminiLLMProvider(api_key="fake", model="m", client=client)
+        spec = ToolSpec(name="t", description="d", parameters={"type": "object", "properties": {}})
+        msgs = [
+            LLMMessage(role="system", content="sys"),
+            LLMMessage(role="user", content="task"),
+        ]
+
+        # Round 1: model calls get_issue with signature SIG_A.
+        r1 = provider.complete(msgs, [spec])
+        assert r1.tool_calls[0].id == "fc_1"
+        assert r1.tool_calls[0].metadata["thought_signature"] == TestMultiTurnHistoryReconstruction.SIG_A
+        msgs.append(LLMMessage(role="assistant", content=None, tool_calls=r1.tool_calls))
+        msgs.append(LLMMessage(role="tool", tool_call_id="fc_1", content="issue body"))
+
+        # Round 2: model calls get_file with signature SIG_B (same session).
+        r2 = provider.complete(msgs, [spec])
+        assert r2.tool_calls[0].id == "fc_2"
+        assert r2.tool_calls[0].metadata["thought_signature"] == TestMultiTurnHistoryReconstruction.SIG_B
+        assert r2.content == "Checking auth.py next."
+        msgs.append(LLMMessage(role="assistant", content=r2.content, tool_calls=r2.tool_calls))
+        msgs.append(LLMMessage(role="tool", tool_call_id="fc_2", content="file contents"))
+
+        # Round 3: continuation succeeds and the history it saw is intact.
+        r3 = provider.complete(msgs, [spec])
+        assert r3.content == "continuation answer"
+        history = client.models.calls[2]["contents"]
+        parts = [(c.role, p) for c in history for p in c.parts]
+        fc_parts = [p for _, p in parts if getattr(p, "function_call", None)]
+        assert [p.function_call.id for p in fc_parts] == ["fc_1", "fc_2"]
+        # The SDK normalizes signature strings to bytes; compare decoded.
+        assert [base64.b64encode(p.thought_signature).decode() for p in fc_parts] == [
+            TestMultiTurnHistoryReconstruction.SIG_A,
+            TestMultiTurnHistoryReconstruction.SIG_B,
+        ]
+        assert [p.function_call.name for p in fc_parts] == ["get_issue", "get_file"]
+
+    def test_second_request_history_is_structurally_valid(self):
+        """Capture the ACTUAL contents of the request after two tool rounds:
+        every FunctionCall carries its API-issued id + signature, every
+        FunctionResponse carries the matching id, and the model's visible
+        text is preserved in its turn."""
+        client = FakeClient([
+            self._fc_response("get_issue", "fc_1", TestMultiTurnHistoryReconstruction.SIG_A),
+            self._fc_response("get_file", "fc_2", TestMultiTurnHistoryReconstruction.SIG_B, text="Now reading auth.py."),
+            make_response(text="done"),
+        ]
+        )
+        provider = GeminiLLMProvider(api_key="fake", model="m", client=client)
+        spec = ToolSpec(name="t", description="d", parameters={"type": "object", "properties": {}})
+        msgs = [LLMMessage(role="user", content="task")]
+        for _ in range(2):
+            r = provider.complete(msgs, [spec])
+            msgs.append(LLMMessage(role="assistant", content=r.content, tool_calls=r.tool_calls))
+            msgs.append(LLMMessage(role="tool", tool_call_id=r.tool_calls[0].id, content="result"))
+        provider.complete(msgs, [spec])  # third request: history must be valid
+
+        contents = client.models.calls[2]["contents"]
+        model_contents = [c for c in contents if c.role == "model"]
+        user_contents = [c for c in contents if c.role == "user"]
+        # Locate FC/FR parts structurally (turn 2's model content is
+        # [text_part, fc_part], so positional indexing would be wrong).
+        fc_parts = [p for c in model_contents for p in c.parts if getattr(p, "function_call", None)]
+        fr_parts = [p.function_response for c in user_contents for p in c.parts if getattr(p, "function_response", None)]
+        assert len(fc_parts) == 2 and len(fr_parts) == 2
+        fc1, fc2 = fc_parts
+        fr1, fr2 = fr_parts
+        # Ids survive on both sides of each pair (required for pairing).
+        assert fc1.function_call.id == "fc_1" and fr1.id == "fc_1"
+        assert fc2.function_call.id == "fc_2" and fr2.id == "fc_2"
+        # Signatures stay on their own FC parts (SDK stores bytes).
+        assert base64.b64encode(fc1.thought_signature).decode() == TestMultiTurnHistoryReconstruction.SIG_A
+        assert base64.b64encode(fc2.thought_signature).decode() == TestMultiTurnHistoryReconstruction.SIG_B
+        # The second turn's visible text was preserved, not dropped.
+        texts = [p.text for c in model_contents for p in c.parts if getattr(p, "text", None)]
+        assert texts == ["Now reading auth.py."]
+        # FR responses carry the tool output.
+        assert fr1.response == {"result": "result"}
+        assert fr2.response == {"result": "result"}
+
+    def test_synthetic_ids_never_sent_to_api(self):
+        """When the API issues no function-call id, our synthetic id is used
+        internally but NEITHER the replayed FC nor the FR carries an id —
+        both sides omit it consistently so pairing stays valid."""
+        client = FakeClient([
+            self._fc_response("get_issue", None, TestMultiTurnHistoryReconstruction.SIG_A),
+            make_response(text="done"),
+        ])
+        provider = GeminiLLMProvider(api_key="fake", model="m", client=client)
+        spec = ToolSpec(name="t", description="d", parameters={"type": "object", "properties": {}})
+        msgs = [LLMMessage(role="user", content="task")]
+        r1 = provider.complete(msgs, [spec])
+        assert r1.tool_calls[0].id.startswith("gem_call_")  # synthetic
+        msgs.append(LLMMessage(role="assistant", content=None, tool_calls=r1.tool_calls))
+        msgs.append(LLMMessage(role="tool", tool_call_id=r1.tool_calls[0].id, content="res"))
+        provider.complete(msgs, [spec])
+
+        contents = client.models.calls[1]["contents"]
+        fc_part = next(p for c in contents if c.role == "model" for p in c.parts if getattr(p, "function_call", None))
+        fr_part = next(p.function_response for c in contents if c.role == "user" for p in c.parts if getattr(p, "function_response", None))
+        assert fc_part.function_call.id is None  # synthetic id not leaked to API
+        assert fr_part.id is None  # both sides omit consistently
+
+    def test_thought_parts_excluded_from_extracted_text(self):
+        """Thought parts (chain-of-thought) never surface as response text."""
+        parts = [
+            SimpleNamespace(text="internal reasoning...", thought=True, thought_signature=None),
+            SimpleNamespace(text=None, function_call=gtypes.FunctionCall(name="t", args={}), thought_signature=None, thought=False),
+        ]
+        resp = SimpleNamespace(candidates=[SimpleNamespace(content=SimpleNamespace(parts=parts))])
+        provider, _ = make_provider([resp])
+        spec = ToolSpec(name="t", description="d", parameters={"type": "object", "properties": {}})
+        response = provider.complete([LLMMessage(role="user", content="x")], [spec])
+        assert response.content is None  # thought text excluded
+        assert response.wants_tool_call
 
 
 class TestErrorMapping:
