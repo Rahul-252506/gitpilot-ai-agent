@@ -331,6 +331,145 @@ class TestStructuredOutput:
         assert outcome.report.issue_summary == "Fixed schema."
 
 
+class TestDuplicateToolCallGuard:
+    """Exact-duplicate read-tool calls are skipped, not re-executed.
+
+    A looping model that re-requests the same get_file burns no extra tool
+    budget on it and receives guidance to use the evidence it already has.
+    Same tool with different arguments is still executed normally.
+    """
+
+    def test_duplicate_identical_call_not_executed_twice(self):
+        report = {
+            "issue_summary": "Duplicate get_file requested twice.",
+            "category": "bug",
+            "priority": "medium",
+            "root_cause": "Token not refreshed.",
+            "evidence": [
+                {"source": "get_file:src/auth/token_manager.py", "quote": "refresh_token", "kind": "confirmed"}
+            ],
+            "affected_files": ["src/auth/token_manager.py"],
+            "resolution_steps": ["Fix refresh."],
+            "test_plan": [],
+            "confidence": 0.7,
+            "warnings": [],
+        }
+        path_args = {"owner": "acme", "repo": "demo", "path": "src/auth/token_manager.py"}
+        script = [
+            tool_call_response("get_issue", REPO_ARGS),
+            tool_call_response("get_file", path_args),
+            tool_call_response("get_file", path_args),  # exact duplicate
+            final_response(report),
+        ]
+        outcome, events, _, _, _ = run_agent(script)
+        assert outcome.completed
+        # get_file executed exactly once despite being requested twice.
+        started = [tn for t, _, _, tn in events if t == "tool_started"]
+        assert started.count("get_file") == 1
+        assert started[0] == "get_issue"
+        # A duplicate-skip event was surfaced on the timeline.
+        dup = [(s, tn) for t, s, _, tn in events if t == "status" and s == "duplicate"]
+        assert len(dup) == 1 and dup[0][1] == "get_file"
+
+    def test_duplicate_guidance_fed_back_to_model(self):
+        """The skipped call's tool message tells the model to use existing
+        evidence instead of re-fetching — and it consumes a step."""
+        seen: list[list[str]] = []
+
+        def decide(messages, tools):
+            seen.append([m.content or "" for m in messages if m.role == "tool"])
+            tool_contents = [m.content or "" for m in messages if m.role == "tool"]
+            if not tool_contents:
+                return tool_call_response("get_file", {"owner": "acme", "repo": "demo", "path": "src/auth/token_manager.py"})
+            if not any("already executed" in c for c in tool_contents):
+                # Second turn: request the same call again -> should be skipped.
+                return tool_call_response("get_file", {"owner": "acme", "repo": "demo", "path": "src/auth/token_manager.py"})
+            # Third turn: we saw the guidance; finish.
+            return final_response({
+                "issue_summary": "Stopped looping and finished.",
+                "category": "bug",
+                "priority": "medium",
+                "root_cause": "Observed via duplicate guidance.",
+                "evidence": [],
+                "affected_files": [],
+                "resolution_steps": [],
+                "test_plan": [],
+                "confidence": 0.5,
+                "warnings": [],
+            })
+
+        outcome, events, _, _, _ = run_agent([decide, decide, decide])
+        assert outcome.completed
+        # The final provider turn saw the duplicate guidance in context.
+        last_turn_msgs = seen[-1]
+        assert any("already executed" in c and "Do not repeat the call" in c for c in last_turn_msgs)
+        # The duplicate still consumed one step (guard is not free).
+        assert len([t for t, _, _, _ in events if t == "tool_started"]) == 1
+
+    def test_same_tool_different_args_still_executed(self):
+        """Re-using a tool with different arguments is legitimate and must
+        not be blocked by the duplicate guard."""
+        report = {
+            "issue_summary": "Two files inspected.",
+            "category": "bug",
+            "priority": "medium",
+            "root_cause": "Login path broken.",
+            "evidence": [],
+            "affected_files": [],
+            "resolution_steps": [],
+            "test_plan": [],
+            "confidence": 0.6,
+            "warnings": [],
+        }
+        script = [
+            tool_call_response("get_issue", REPO_ARGS),
+            tool_call_response("get_file", {"owner": "acme", "repo": "demo", "path": "src/app.py"}),
+            tool_call_response("get_file", {"owner": "acme", "repo": "demo", "path": "src/auth/token_manager.py"}),
+            final_response(report),
+        ]
+        outcome, events, _, _, _ = run_agent(script)
+        assert outcome.completed
+        started = [tn for t, _, _, tn in events if t == "tool_started"]
+        assert started == ["get_issue", "get_file", "get_file"]
+        assert not any(t == "status" and s == "duplicate" for t, s, _, _ in events)
+
+    def test_normal_single_execution_unchanged(self, normal_script):
+        """The guard adds no behavior to an investigation with no repeats."""
+        outcome, events, _, _, _ = run_agent(normal_script)
+        assert outcome.completed
+        assert outcome.report is not None
+        started = [tn for t, _, _, tn in events if t == "tool_started"]
+        assert started == ["get_issue", "search_repository", "get_file"]
+        assert not any(t == "status" and s == "duplicate" for t, s, _, _ in events)
+
+    def test_write_approval_unaffected_by_guard(self):
+        """A write tool proposed twice still creates two pending approvals —
+        the duplicate guard never touches the write path."""
+        write_args = {"owner": "acme", "repo": "demo", "issue_number": 42, "labels": ["bug"]}
+        script = [
+            tool_call_response("get_issue", REPO_ARGS),
+            tool_call_response("add_issue_label", write_args),
+            tool_call_response("add_issue_label", write_args),  # identical write
+            final_response({
+                "issue_summary": "Investigated.",
+                "category": "bug",
+                "priority": "high",
+                "root_cause": "Token not refreshed.",
+                "evidence": [],
+                "affected_files": [],
+                "resolution_steps": [],
+                "test_plan": [],
+                "confidence": 0.8,
+                "warnings": [],
+            }),
+        ]
+        outcome, events, approvals, state, _ = run_agent(script)
+        assert outcome.completed
+        assert len(approvals) == 2  # both proposals recorded, none executed
+        assert state.get("label_posts") in (None, [])  # still never executed
+        assert not any(t == "status" and s == "duplicate" for t, s, _, _ in events)
+
+
 class TestLimits:
     def test_step_limit_reached(self):
         script = repeat_tool_call("get_issue", REPO_ARGS, times=50)

@@ -50,6 +50,32 @@ EVENT_APPROVAL_PROPOSED = "approval_proposed"
 EventSink = Callable[[str, str, str, str | None], None]
 ApprovalSink = Callable[[str, dict, str], str]
 
+_DUPLICATE_GUIDANCE = (
+    "This exact {name} call was already executed earlier in this investigation; "
+    "its full result is already in the conversation above and was NOT fetched "
+    "again. Do not repeat the call. Instead, use the existing evidence to "
+    "continue reasoning, or pick a DIFFERENT tool or different arguments if "
+    "you genuinely need more information. When the evidence is sufficient, "
+    "produce the final structured resolution report."
+)
+
+
+def _tool_call_signature(name: str, arguments: dict[str, Any]) -> str:
+    """Stable signature for a tool invocation: tool name + normalized args.
+
+    Keys are sorted and encoded canonically, so ``{"a": 1, "b": 2}`` and
+    ``{"b": 2, "a": 1}`` are the same call, while any change in a value
+    produces a different signature (legitimate re-use of a tool with
+    different arguments is never blocked).
+    """
+    try:
+        normalized = json.dumps(
+            arguments, sort_keys=True, separators=(",", ":"), default=str
+        )
+    except (TypeError, ValueError):
+        normalized = repr(sorted(arguments.items(), key=lambda kv: str(kv[0])))
+    return f"{name}:{normalized}"
+
 
 @dataclass
 class AgentOutcome:
@@ -106,6 +132,10 @@ class AgentOrchestrator:
         ctx.messages.append(
             LLMMessage(role="user", content=build_task_prompt(repository, number))
         )
+        # Signatures of read-tool calls already executed in THIS run. Used to
+        # short-circuit exact duplicate requests from the model so a looping
+        # agent cannot burn its whole step budget re-fetching the same file.
+        executed_calls: set[str] = set()
 
         while True:
             if ctx.timed_out:
@@ -158,7 +188,7 @@ class AgentOrchestrator:
                     return outcome
                 continue  # a correction round was scheduled
 
-            self._handle_tool_calls(ctx, response.tool_calls)
+            self._handle_tool_calls(ctx, response.tool_calls, executed_calls)
             if ctx.fatal_error is not None:
                 return self._fail(ctx, ctx.fatal_error)
 
@@ -166,7 +196,9 @@ class AgentOrchestrator:
         return self._fail(ctx, AgentError("Agent loop ended unexpectedly."))
 
     # ---------------- tool handling ----------------
-    def _handle_tool_calls(self, ctx: AgentContext, tool_calls: list[ToolCall]) -> None:
+    def _handle_tool_calls(
+        self, ctx: AgentContext, tool_calls: list[ToolCall], executed_calls: set[str]
+    ) -> None:
         # Append the assistant message once with all requested calls, then
         # append one bounded tool-result message per call.
         ctx.messages.append(
@@ -180,7 +212,7 @@ class AgentOrchestrator:
             if ctx.step_limit_reached:
                 break
             ctx.steps += 1
-            result = self._execute_tool(ctx, tc)
+            result = self._execute_tool(ctx, tc, executed_calls)
             if result is None:
                 continue
             ctx.messages.append(
@@ -191,7 +223,9 @@ class AgentOrchestrator:
                 )
             )
 
-    def _execute_tool(self, ctx: AgentContext, tc: ToolCall) -> ToolResult | None:
+    def _execute_tool(
+        self, ctx: AgentContext, tc: ToolCall, executed_calls: set[str]
+    ) -> ToolResult | None:
         tool = self.registry.get(tc.name)
 
         if tool is None:
@@ -222,6 +256,24 @@ class AgentOrchestrator:
                 ),
                 pending_approval=True,
             )
+
+        # Duplicate guard (read tools only): skip an exact repeat of a call
+        # that already executed in this run and tell the model to use the
+        # existing evidence instead. Write tools never reach this path — the
+        # approval branch above always runs for them, unchanged.
+        signature = _tool_call_signature(tc.name, tc.arguments)
+        if signature in executed_calls:
+            self._emit(
+                EVENT_STATUS,
+                "duplicate",
+                f"Skipped duplicate {tc.name} call (already executed)",
+                tool_name=tc.name,
+            )
+            return ToolResult(
+                summary=f"Duplicate {tc.name} call skipped",
+                text=_DUPLICATE_GUIDANCE.format(name=tc.name),
+            )
+        executed_calls.add(signature)
 
         self._emit(
             EVENT_TOOL_STARTED,
