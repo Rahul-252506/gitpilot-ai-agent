@@ -15,6 +15,7 @@ from app.services.llm.mock_provider import (
     final_response,
     tool_call_response,
 )
+from app.services.llm.demo_provider import DemoLLMProvider
 from app.services.llm.gemini_provider import GeminiLLMProvider
 from app.services.llm.openai_provider import OpenAILLMProvider
 
@@ -27,6 +28,7 @@ __all__ = [
     "OpenAILLMProvider",
     "GeminiLLMProvider",
     "MockLLMProvider",
+    "DemoLLMProvider",
     "final_response",
     "tool_call_response",
     "get_llm_provider",
@@ -38,6 +40,8 @@ def get_llm_provider(settings: Settings) -> LLMProvider:
     provider_name = settings.llm_provider.lower()
     if provider_name == "mock":
         return MockLLMProvider()
+    if provider_name == "demo":
+        return DemoLLMProvider()
     if provider_name == "openai":
         return OpenAILLMProvider(
             api_key=settings.openai_api_key,
@@ -51,5 +55,6 @@ def get_llm_provider(settings: Settings) -> LLMProvider:
             temperature=settings.llm_temperature,
         )
     raise LLMConfigurationError(
-        f"Unknown LLM_PROVIDER {provider_name!r}. Use 'gemini', 'openai' or 'mock'."
+        f"Unknown LLM_PROVIDER {provider_name!r}. Use 'gemini', 'openai', "
+        f"'demo' or 'mock'."
     )

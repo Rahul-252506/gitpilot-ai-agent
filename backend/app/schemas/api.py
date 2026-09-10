@@ -98,6 +98,9 @@ class AnalysisListResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str = "ok"
+    # "demo" when the backend runs the deterministic demo fixture
+    # (LLM_PROVIDER=demo); lets the UI label Demo Mode explicitly.
+    mode: str = "live"
 
 
 class ErrorDetail(BaseModel):

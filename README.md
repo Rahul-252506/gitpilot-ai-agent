@@ -113,7 +113,7 @@ context-dependent tool choices.
 | Variable                    | Required | Default            | Purpose                                              |
 | --------------------------- | -------- | ------------------ | ---------------------------------------------------- |
 | `GITHUB_TOKEN`              | yes*     | —                  | Server-side GitHub token (`repo` read scope; `issues:write` only if you want approved writes) |
-| `LLM_PROVIDER`              | no       | `mock`             | `gemini` (full agent), `openai`, or `mock` (offline demo) |
+| `LLM_PROVIDER`              | no       | `mock`             | `gemini` (full agent), `openai`, `demo` (recorded demo fixture), or `mock` (offline dev) |
 | `GEMINI_API_KEY`            | if gemini| —                  | Gemini key (server-side only)                        |
 | `GEMINI_MODEL`              | no       | `gemini-flash-latest` | Model alias; auto-tracks current flash models     |
 | `OPENAI_API_KEY`            | if openai| —                  | OpenAI key (server-side only)                        |
@@ -203,6 +203,15 @@ Optional: `frontend/.env.local` with `NEXT_PUBLIC_API_BASE_URL=http://localhost:
 > next run. Transient `503`/`429` responses are retried automatically with
 > backoff; hard quota exhaustion fails the analysis cleanly.
 >
+> **Demo Mode (`LLM_PROVIDER=demo`):** for recording product demos when the
+> live LLM is unavailable. The real pipeline runs — agent loop, GitHub
+> tools, timeline, persistence, approval safety — but the model reasoning
+> step is replaced by a deterministic fixture built from the run's actual
+> tool output. No LLM API call is made and nothing is attributed to Gemini:
+> every report carries an explicit "DEMO MODE" warning, the UI shows a
+> `DEMO MODE · no live LLM` badge (health reports `mode: "demo"`), and
+> switching back to live is one env var (`LLM_PROVIDER=gemini`).
+>
 > **No credentials?** Run with `LLM_PROVIDER=mock` (the default). The full
 > stack works; the agent's first GitHub call fails with a clear, actionable
 > error. With `GITHUB_TOKEN` set but `LLM_PROVIDER=mock`, the demo provider
@@ -213,7 +222,7 @@ Optional: `frontend/.env.local` with `NEXT_PUBLIC_API_BASE_URL=http://localhost:
 
 | Method | Path                                | Purpose                                     |
 | ------ | ----------------------------------- | ------------------------------------------- |
-| GET    | `/api/health`                       | `{"status":"ok"}`                           |
+| GET    | `/api/health`                       | `{"status":"ok","mode":"live\|demo"}`        |
 | POST   | `/api/analyses`                     | Start an analysis → `{analysis_id, status}` |
 | GET    | `/api/analyses`                     | Recent analyses (`limit`, `offset`)         |
 | GET    | `/api/analyses/{id}`                | State, execution events, report, approvals  |

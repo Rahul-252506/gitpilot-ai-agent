@@ -34,6 +34,7 @@ export default function Home() {
   const [approvalBusy, setApprovalBusy] = useState(false);
   const [history, setHistory] = useState<AnalysisListItem[]>([]);
   const [online, setOnline] = useState<boolean | null>(null);
+  const [demoMode, setDemoMode] = useState(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const stopPolling = useCallback(() => {
@@ -90,7 +91,11 @@ export default function Home() {
   useEffect(() => {
     let cancelled = false;
     health()
-      .then(() => !cancelled && setOnline(true))
+      .then((h) => {
+        if (cancelled) return;
+        setOnline(true);
+        setDemoMode(h.mode === "demo");
+      })
       .catch(() => !cancelled && setOnline(false));
     refreshHistory();
     return () => {
@@ -176,12 +181,14 @@ export default function Home() {
             repository evidence, and produces a structured resolution report.
           </p>
         </div>
-        <span className={`badge ${online === false ? "offline" : "online"}`}>
+        <span className={`badge ${demoMode ? "demo" : online === false ? "offline" : "online"}`}>
           {online === null
             ? "checking backend…"
-            : online
-              ? `backend online · ${API_BASE_URL}`
-              : `backend offline · ${API_BASE_URL}`}
+            : demoMode
+              ? `DEMO MODE · no live LLM · ${API_BASE_URL}`
+              : online
+                ? `backend online · ${API_BASE_URL}`
+                : `backend offline · ${API_BASE_URL}`}
         </span>
       </header>
 
@@ -290,6 +297,14 @@ export default function Home() {
                   your explicit approval
                 </li>
               </ol>
+              {demoMode && (
+                <div className="banner warn" style={{ marginTop: 14 }}>
+                  ⚠ Demo Mode is active (LLM_PROVIDER=demo): the agent loop,
+                  GitHub tools and timeline are real, but reports come from a
+                  deterministic fixture — no live Gemini API call. Every report
+                  states this in its warnings.
+                </div>
+              )}
               <p className="meta">
                 Configure with{" "}
                 <span className="mono">GITHUB_TOKEN</span>,{" "}

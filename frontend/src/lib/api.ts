@@ -3,6 +3,7 @@ import type {
   AnalysisList,
   ApprovalDecision,
   ApiErrorBody,
+  HealthInfo,
 } from "./types";
 
 export const API_BASE_URL: string =
@@ -101,8 +102,8 @@ export function reject(
   });
 }
 
-export function health(): Promise<{ status: string }> {
-  return request<{ status: string }>("/api/health");
+export function health(): Promise<HealthInfo> {
+  return request<HealthInfo>("/api/health");
 }
 
 export function isActive(status: string): boolean {

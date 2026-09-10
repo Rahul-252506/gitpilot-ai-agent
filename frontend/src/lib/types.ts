@@ -86,6 +86,12 @@ export interface AnalysisList {
   total: number;
 }
 
+export interface HealthInfo {
+  status: string;
+  /** "demo" when the backend runs the clearly-labeled demo fixture. */
+  mode: "live" | "demo";
+}
+
 export interface ApiErrorBody {
   detail?: { code?: string; message?: string };
 }

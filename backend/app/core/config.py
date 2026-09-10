@@ -31,10 +31,11 @@ class Settings:
         self.gemini_api_key: str = os.getenv("GEMINI_API_KEY", "").strip()
 
         # --- LLM provider ---
-        # "gemini" (real), "openai" (real), or "mock" (deterministic, for
-        # tests / offline demo). Defaults to "mock" so the backend boots
-        # without credentials and fails clearly if a real provider is
-        # requested without its key.
+        # "gemini" (real), "openai" (real), "demo" (deterministic fixture
+        # for the product demo; real GitHub tools, no LLM API call), or
+        # "mock" (deterministic, for tests / offline demo). Defaults to
+        # "mock" so the backend boots without credentials and fails clearly
+        # if a real provider is requested without its key.
         self.llm_provider: str = os.getenv("LLM_PROVIDER", "mock").strip().lower()
         self.openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
         self.gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-flash-latest").strip()
@@ -79,7 +80,7 @@ class Settings:
 
     @property
     def llm_configured(self) -> bool:
-        if self.llm_provider == "mock":
+        if self.llm_provider in ("mock", "demo"):
             return True
         if self.llm_provider == "openai":
             return bool(self.openai_api_key)

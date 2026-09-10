@@ -21,8 +21,10 @@ def get_service(request: Request) -> AnalysisService:
 
 
 @router.get("/health", response_model=HealthResponse, tags=["system"])
-def health() -> HealthResponse:
-    return HealthResponse(status="ok")
+def health(request: Request) -> HealthResponse:
+    settings = request.app.state.settings
+    mode = "demo" if settings.llm_provider == "demo" else "live"
+    return HealthResponse(status="ok", mode=mode)
 
 
 @router.post(

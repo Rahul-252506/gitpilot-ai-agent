@@ -19,7 +19,7 @@ class TestHealth:
         client = make_client(tmp_path)
         resp = client.get("/api/health")
         assert resp.status_code == 200
-        assert resp.json() == {"status": "ok"}
+        assert resp.json() == {"status": "ok", "mode": "live"}
 
 
 class TestStartAnalysis:
