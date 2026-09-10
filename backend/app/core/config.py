@@ -49,7 +49,7 @@ class Settings:
         )
 
         # --- Agent limits ---
-        self.agent_max_steps: int = int(os.getenv("AGENT_MAX_STEPS", "12"))
+        self.agent_max_steps: int = int(os.getenv("AGENT_MAX_STEPS", "20"))
         self.agent_timeout_seconds: int = int(os.getenv("AGENT_TIMEOUT_SECONDS", "300"))
         self.tool_max_output_chars: int = int(
             os.getenv("TOOL_MAX_OUTPUT_CHARS", "8000")
