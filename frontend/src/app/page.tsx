@@ -10,6 +10,7 @@ import ResolutionReport from "@/components/ResolutionReport";
 import {
   ApiError,
   API_BASE_URL,
+  API_ENDPOINT_LABEL,
   approve,
   getAnalysis,
   health,
@@ -185,10 +186,10 @@ export default function Home() {
           {online === null
             ? "checking backend…"
             : demoMode
-              ? `DEMO MODE · no live LLM · ${API_BASE_URL}`
-              : online
-                ? `backend online · ${API_BASE_URL}`
-                : `backend offline · ${API_BASE_URL}`}
+                ? `DEMO MODE · no live LLM · via ${API_ENDPOINT_LABEL}`
+                : online
+                  ? `backend online · via ${API_ENDPOINT_LABEL}`
+                  : `backend offline · tried ${API_ENDPOINT_LABEL}`}
         </span>
       </header>
 

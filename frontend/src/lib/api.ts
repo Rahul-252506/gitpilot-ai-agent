@@ -6,11 +6,32 @@ import type {
   HealthInfo,
 } from "./types";
 
-export const API_BASE_URL: string =
-  (process.env.NEXT_PUBLIC_API_BASE_URL as string | undefined)?.replace(
-    /\/$/,
-    ""
-  ) || "http://localhost:8000";
+/**
+ * How the frontend reaches the GitPilot backend:
+ *
+ * - When the Next.js same-origin proxy rewrite is configured (an API base env
+ *   var is set — always true on Vercel), the browser calls its own origin
+ *   ("" prefix) and next.config.mjs forwards /api/* to the backend. No CORS
+ *   is involved, so every deployment URL works.
+ * - Otherwise (plain local dev without env vars) fall back to calling the
+ *   local backend directly, which allows the localhost origin via CORS.
+ */
+const configuredBase: string = (
+  process.env.NEXT_PUBLIC_API_BASE_URL as string | undefined
+)
+  ?.replace(/\/$/, "")
+  ?.trim() || "";
+const proxyConfigured: boolean = Boolean(
+  process.env.API_PROXY_TARGET || configuredBase
+);
+
+export const API_BASE_URL: string = proxyConfigured
+  ? ""
+  : configuredBase || "http://localhost:8000";
+
+/** Human-readable endpoint description for badges/error messages. */
+export const API_ENDPOINT_LABEL: string =
+  API_BASE_URL || "same-origin /api proxy";
 
 export class ApiError extends Error {
   code: string;
@@ -33,7 +54,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     });
   } catch {
     throw new ApiError(
-      `Cannot reach the GitPilot backend at ${API_BASE_URL}. Is it running?`,
+      `Cannot reach the GitPilot backend (${API_ENDPOINT_LABEL}). Is it running?`,
       "network_error",
       0
     );
